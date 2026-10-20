@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tile Field</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000000; overscroll-behavior: none; }
+  #board {
+    position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; display: block;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+  }
+</style>
+</head>
+<body>
+<canvas id="board"></canvas>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+     CONFIG
+     ===================================================================== */
+  const COLORS = { frame: '#000000', bg: '#080808', dark: '#181818', pink: '#F71B90' };
+  const FLIP_MS = 190;          // flip duration
+  const PERSPECTIVE = 2.5;      // flip depth, in tile sizes (lower = stronger 3D look)
+  const LIFE_MS = 800;          // how long a slid tile stays pink while its note dies away
+
+  // Frame: sides and top are a little thicker than a tile, the bottom is thicker (holds the reset button).
+  const SIDE_FRAC = 1.25;       // x tile size
+  const BOTTOM_FRAC = 3.2;      // x tile size
+
+  // Pitch map: A minor pentatonic, A2 (110 Hz) up about four octaves.
+  const SCALE = [0, 3, 5, 7, 10];
+  const BASE_FREQ = 110;
+  const COL_STEPS = 15;
+  const ROW_STEPS = 5;
+  const MAX_NOTE = COL_STEPS + ROW_STEPS;
+
+  const canvas = document.getElementById('board');
+  const g = canvas.getContext('2d', { alpha: false });
+
+  /* =====================================================================
+     AUDIO
+     One voice per pitch. Each voice has two outputs:
+       sustain: held while at least one tapped (persistent) tile uses the pitch
+       pluck:   a quick attack that dies away on its own, used when sliding
+     ===================================================================== */
+  const AudioEngine = (() => {
+    let ac = null, master = null, comp = null, loopBus = null;
+    let capSend = () => {}, capReadyP = null, capChunks = [], capOn = false, capResolve = null;
+    const voices = new Map();   // note -> voice
+    const counts = new Map();   // note -> number of persistent pink tiles on that pitch
+
+    const freqOf = n => BASE_FREQ * Math.pow(2, (12 * Math.floor(n / 5) + SCALE[n % 5]) / 12);
+    const levelOf = (n, count) => 0.5 * (1 - 0.45 * n / MAX_NOTE) * (1 + 0.4 * (1 - 1 / count));
+
+    function init() {
+      if (!ac) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        ac = new AC({ latencyHint: 'interactive' });
+
+        master = ac.createGain();
+        master.gain.value = 0.9;
+        comp = ac.createDynamicsCompressor();
+        comp.threshold.value = -20; comp.ratio.value = 4; comp.attack.value = 0.005; comp.release.value = 0.2;
+        master.connect(comp); comp.connect(ac.destination);
+
+        const len = Math.floor(ac.sampleRate * 2.4);
+        const ir = ac.createBuffer(2, len, ac.sampleRate);
+        for (let ch = 0; ch < 2; ch++) {
+          const d = ir.getChannelData(ch);
+          for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.5);
+        }
+        const conv = ac.createConvolver(); conv.buffer = ir;
+        const send = ac.createGain(); send.gain.value = 0.28;
+        master.connect(send); send.connect(conv); conv.connect(comp);
+
+        // Loops play on their own bus, which never passes through the tap below, so they are never re-recorded.
+        loopBus = ac.createGain(); loopBus.gain.value = 0.8;
+        const lc = ac.createDynamicsCompressor();
+        lc.threshold.value = -14; lc.ratio.value = 6;
+        loopBus.connect(lc); lc.connect(ac.destination);
+
+        setupCapture(comp);   // records exactly what the tile synth sends to the speakers
+      }
+      if (ac.state === 'suspended') ac.resume();
+    }
+
+    function createVoice(n) {
+      const f = freqOf(n);
+      const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1500; lp.Q.value = 0.5;
+      const sus = ac.createGain(); sus.gain.value = 0;
+      const plk = ac.createGain(); plk.gain.value = 0;
+      lp.connect(sus); lp.connect(plk);
+
+      const a = ac.createOscillator(); a.type = 'sine'; a.frequency.value = f;
+      const b = ac.createOscillator(); b.type = 'triangle'; b.frequency.value = f; b.detune.value = 7;
+      const c = ac.createOscillator(); c.type = 'sine'; c.frequency.value = f * 2;
+      const gb = ac.createGain(); gb.gain.value = 0.35;
+      const gc = ac.createGain(); gc.gain.value = 0.1;
+      a.connect(lp); b.connect(gb); gb.connect(lp); c.connect(gc); gc.connect(lp);
+
+      let dest = master;
+      if (ac.createStereoPanner) {
+        const pan = ac.createStereoPanner(); pan.pan.value = (n / MAX_NOTE - 0.5) * 0.9;
+        pan.connect(master); dest = pan;
+      }
+      sus.connect(dest); plk.connect(dest);
+
+      const t = ac.currentTime;
+      a.start(t); b.start(t); c.start(t);
+      const v = { lp, sus, plk, oscs: [a, b, c], timer: 0 };
+      voices.set(n, v);
+      return v;
+    }
+
+    function keepAlive(n, v) {
+      clearTimeout(v.timer);
+      v.timer = setTimeout(() => {
+        if ((counts.get(n) || 0) > 0 || voices.get(n) !== v) return;
+        v.oscs.forEach(o => { try { o.stop(); } catch (_) {} o.disconnect(); });
+        v.sus.disconnect(); v.plk.disconnect(); voices.delete(n);
+      }, 2600);
+    }
+
+    function updateMaster() {
+      master.gain.setTargetAtTime(0.9 / Math.sqrt(Math.max(1, voices.size * 0.6)), ac.currentTime, 0.05);
+    }
+
+    function brighten(v, now) {
+      v.lp.frequency.cancelScheduledValues(now);
+      v.lp.frequency.setValueAtTime(3800, now);
+      v.lp.frequency.setTargetAtTime(1500, now + 0.01, 0.14);
+    }
+
+    function applySustain(n, count, trigger) {
+      const now = ac.currentTime;
+      let v = voices.get(n);
+      if (count > 0) {
+        if (!v) v = createVoice(n);
+        clearTimeout(v.timer);
+        const lvl = levelOf(n, count), p = v.sus.gain;
+        p.cancelScheduledValues(now);
+        p.setValueAtTime(p.value, now);
+        if (trigger) {
+          p.setTargetAtTime(lvl * 1.35, now, 0.006);
+          p.setTargetAtTime(lvl, now + 0.05, 0.09);
+          brighten(v, now);
+        } else p.setTargetAtTime(lvl, now, 0.03);
+      } else if (v) {
+        const p = v.sus.gain;
+        p.cancelScheduledValues(now);
+        p.setValueAtTime(p.value, now);
+        p.setTargetAtTime(0, now, 0.09);
+        keepAlive(n, v);
+      }
+      updateMaster();
+    }
+
+    // A tapped tile switched on (+1) or off (-1) on this pitch.
+    function sustain(n, delta) {
+      if (!ac) return;
+      const cnt = Math.max(0, (counts.get(n) || 0) + delta);
+      if (cnt) counts.set(n, cnt); else counts.delete(n);
+      applySustain(n, cnt, delta > 0);
+    }
+
+    // A slid tile: instant attack, then it fades by itself, like a key that has been struck.
+    function pluck(n) {
+      if (!ac) return;
+      const now = ac.currentTime;
+      const v = voices.get(n) || createVoice(n);
+      const p = v.plk.gain;
+      p.cancelScheduledValues(now);
+      p.setValueAtTime(p.value, now);
+      p.setTargetAtTime(levelOf(n, 1) * 1.2, now, 0.004);
+      p.setTargetAtTime(0, now + 0.025, 0.26);
+      brighten(v, now);
+      keepAlive(n, v);
+      updateMaster();
+    }
+
+    // Recount sustained pitches (after a resize or reset).
+    function resync(newCounts) {
+      if (!ac) return;
+      const all = new Set([...counts.keys(), ...newCounts.keys()]);
+      counts.clear();
+      newCounts.forEach((c, n) => counts.set(n, c));
+      all.forEach(n => applySustain(n, counts.get(n) || 0, false));
+    }
+
+    /* ---- capture: PCM tap on the synth's final output (after the compressor) ---- */
+    function setupCapture(src) {
+      const sink = ac.createGain(); sink.gain.value = 0; sink.connect(ac.destination);
+      capReadyP = (async () => {
+        try {
+          const code = `class Cap extends AudioWorkletProcessor {
+            constructor() { super(); this.on = false;
+              this.port.onmessage = e => { this.on = e.data; if (!e.data) this.port.postMessage(null); }; }
+            process(inputs) {
+              const c = inputs[0];
+              if (this.on && c && c.length) { const l = c[0].slice(), r = (c[1] || c[0]).slice(); this.port.postMessage([l, r], [l.buffer, r.buffer]); }
+              return true; } }
+            registerProcessor('tile-cap', Cap);`;
+          const url = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+          await ac.audioWorklet.addModule(url); URL.revokeObjectURL(url);
+          const node = new AudioWorkletNode(ac, 'tile-cap', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2], channelCount: 2, channelCountMode: 'explicit' });
+          node.port.onmessage = e => { if (e.data === null) finishCapture(); else capChunks.push(e.data); };
+          src.connect(node); node.connect(sink);
+          capSend = on => node.port.postMessage(on);
+        } catch (_) {                      // fallback for browsers without AudioWorklet
+          const sp = ac.createScriptProcessor(2048, 2, 2);
+          sp.onaudioprocess = e => { if (capOn) capChunks.push([e.inputBuffer.getChannelData(0).slice(), e.inputBuffer.getChannelData(1).slice()]); };
+          src.connect(sp); sp.connect(sink);
+          capSend = on => { capOn = on; if (!on) finishCapture(); };
+        }
+      })();
+    }
+
+    function finishCapture() {
+      const ch = capChunks; capChunks = [];
+      const n = ch.reduce((a, c) => a + c[0].length, 0);
+      const l = new Float32Array(n), r = new Float32Array(n);
+      let o = 0;
+      for (const c of ch) { l.set(c[0], o); r.set(c[1], o); o += c[0].length; }
+      if (capResolve) { capResolve({ l, r }); capResolve = null; }
+    }
+
+    const available = () => !!ac;
+    const captureReady = () => capReadyP || Promise.resolve();
+    const now = () => (ac ? ac.currentTime : 0);
+    function startCapture() { capChunks = []; capSend(true); }
+    function stopCapture() { return new Promise(res => { capResolve = res; capSend(false); }); }
+
+    // Turns captured audio into a looping layer with its own source. Returns null for silence.
+    function makeLoop(data) {
+      const { l, r } = data;
+      let peak = 0;
+      for (let i = 0; i < l.length; i++) peak = Math.max(peak, Math.abs(l[i]), Math.abs(r[i]));
+      if (l.length < ac.sampleRate * 0.15 || peak < 0.002) return null;
+      const f = Math.min(240, l.length >> 1);          // ~5 ms edge fades to avoid a click at the loop seam
+      for (let i = 0; i < f; i++) {
+        const k = i / f;
+        l[i] *= k; r[i] *= k; l[l.length - 1 - i] *= k; r[r.length - 1 - i] *= k;
+      }
+      const buf = ac.createBuffer(2, l.length, ac.sampleRate);
+      buf.copyToChannel(l, 0); buf.copyToChannel(r, 1);
+      return { buf, src: null, gain: null, dur: buf.duration, t0: 0 };   // not playing yet: see playLoop
+    }
+
+    // Starts (or restarts from the beginning) a loop on its own source.
+    function playLoop(loop) {
+      stopLoop(loop);
+      const src = ac.createBufferSource(); src.buffer = loop.buf; src.loop = true;
+      const gn = ac.createGain();
+      src.connect(gn); gn.connect(loopBus);
+      src.start();
+      loop.src = src; loop.gain = gn; loop.t0 = ac.currentTime;
+    }
+
+    // Stops a loop with a very short fade; its buffer is kept so it can be played again.
+    function stopLoop(loop) {
+      const src = loop.src, gn = loop.gain;
+      if (!src) return;
+      loop.src = null; loop.gain = null;
+      const t = ac.currentTime;
+      gn.gain.cancelScheduledValues(t);
+      gn.gain.setValueAtTime(gn.gain.value, t);
+      gn.gain.setTargetAtTime(0, t, 0.01);
+      try { src.stop(t + 0.08); } catch (_) {}
+      setTimeout(() => { src.disconnect(); gn.disconnect(); }, 200);
+    }
+
+    return { init, sustain, pluck, resync, available, captureReady, now, startCapture, stopCapture, makeLoop, playLoop, stopLoop };
+  })();
+
+  /* =====================================================================
+     GRID STATE
+     kind: 0 = black, 1 = tapped (stays until tapped again), 2 = slid (fades out)
+     ===================================================================== */
+  let dpr = 1, W = 0, H = 0;
+  let cols = 0, rows = 0, cell = 0, tile = 0, gap = 1, ox = 0, oy = 0, gridW = 0, gridH = 0;
+  const btn = { x: 0, y: 0, r: 0 };
+  const rec = { x: 0, y: 0, r: 0, digit: 12, state: 'idle', count: 0, timers: [], maxTimer: 0 };  // recorder button
+  const bar = { w: 0, h: 0, gap: 0 };
+  let slots = [];                     // positions of loop bars in the bottom frame
+  const loops = [];                   // { src, dur, t0 }, one per bar
+  let pos = new Float32Array(0);      // flip progress per tile, 0 = black, 1 = pink
+  let target = new Uint8Array(0);     // desired visual state per tile
+  let kind = new Uint8Array(0);
+  let noteMap = new Uint8Array(0);    // pitch per tile
+  const pink = new Set();             // r * 65536 + c of tapped tiles, kept across resizes
+  const animating = new Set();
+  const transients = new Map();       // slid tile index -> time it flips back
+
+  const keyOf = i => ((i / cols) | 0) * 65536 + (i % cols);
+
+  /* =====================================================================
+     LAYOUT: whole device pixels only, so every gap is exactly the same width
+     ===================================================================== */
+  function computeLayout() {
+    dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
+    const w = Math.round(cssW * dpr), h = Math.round(cssH * dpr);
+    const gp = Math.max(1, Math.round(dpr));
+    const tCss = cssW >= 2400 ? 20 : cssW >= 1600 ? 18 : 17;
+    const want = tCss * dpr;
+    const side = Math.round(want * SIDE_FRAC), bottom = Math.round(want * BOTTOM_FRAC);
+    const iw = Math.max(cell || 50, w - 2 * side), ih = Math.max(50, h - side - bottom);
+
+    let best = null;
+    for (let c = Math.round((tCss - 2) * dpr); c <= Math.round((tCss + 2) * dpr); c++) {
+      if (c <= gp + 1) continue;
+      const nc = Math.max(1, Math.floor((iw + gp) / c)), nr = Math.max(1, Math.floor((ih + gp) / c));
+      const score = (iw + gp - nc * c) + (ih + gp - nr * c) + 0.01 * Math.abs(c - want);
+      if (!best || score < best.score) best = { c, nc, nr, score };
+    }
+    return { w, h, gp, side, bottom, cell: best.c, cols: best.nc, rows: best.nr };
+  }
+
+  function applyLayout(L) {
+    W = L.w; H = L.h; gap = L.gp; cell = L.cell; cols = L.cols; rows = L.rows;
+    tile = cell - gap;
+    gridW = cols * cell - gap; gridH = rows * cell - gap;
+    ox = Math.floor((W - gridW) / 2);
+    const extraV = Math.max(0, H - gridH - L.side - L.bottom);
+    oy = L.side + Math.floor(extraV / 2);
+    const thickness = H - (oy + gridH);
+    btn.r = Math.round(thickness * 0.26);
+    btn.x = W / 2; btn.y = oy + gridH + thickness / 2;
+
+    rec.r = btn.r; rec.x = ox + rec.r * 1.8; rec.y = btn.y;
+    bar.w = Math.max(3, Math.round(cell * 0.5)); bar.h = Math.round(thickness * 0.55);
+    bar.gap = Math.round(cell * 0.5);
+    const by = Math.round(btn.y - bar.h / 2);
+    slots = [];
+    const x1 = Math.round(btn.x - btn.r - bar.gap * 3);
+    for (let x = Math.round(rec.x + rec.r + bar.gap * 2.5); x + bar.w <= x1; x += bar.w + bar.gap) slots.push({ x, y: by });
+    canvas.width = W; canvas.height = H;
+
+    const n = cols * rows;
+    pos = new Float32Array(n); target = new Uint8Array(n); kind = new Uint8Array(n); noteMap = new Uint8Array(n);
+    animating.clear(); transients.clear();
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const cs = cols > 1 ? Math.round(c / (cols - 1) * COL_STEPS) : 0;
+        const rs = rows > 1 ? Math.round((rows - 1 - r) / (rows - 1) * ROW_STEPS) : 0;
+        noteMap[r * cols + c] = cs + rs;
+      }
+    }
+    const counts = new Map();
+    pink.forEach(key => {
+      const r = Math.floor(key / 65536), c = key % 65536;
+      if (r < rows && c < cols) {
+        const i = r * cols + c;
+        target[i] = 1; pos[i] = 1; kind[i] = 1;
+        counts.set(noteMap[i], (counts.get(noteMap[i]) || 0) + 1);
+      }
+    });
+    redrawAll();
+    AudioEngine.resync(counts);
+  }
+
+  /* =====================================================================
+     DRAWING
+     ===================================================================== */
+  function redrawAll() {
+    g.fillStyle = COLORS.frame; g.fillRect(0, 0, W, H);
+    g.fillStyle = COLORS.bg; g.fillRect(ox, oy, gridW, gridH);
+    for (let i = 0; i < target.length; i++) drawStatic(i);
+    drawUI();
+  }
+
+  function drawStatic(i) {
+    const x = ox + (i % cols) * cell, y = oy + ((i / cols) | 0) * cell;
+    g.fillStyle = target[i] ? COLORS.pink : COLORS.dark;
+    g.fillRect(x, y, tile, tile);
+  }
+
+  // Vertical flip: the tile turns around its horizontal axis, and the far edge shrinks.
+  function drawFlip(i, p) {
+    const x = ox + (i % cols) * cell, y = oy + ((i / cols) | 0) * cell;
+    g.fillStyle = COLORS.bg; g.fillRect(x, y, tile, tile);
+
+    const th = (1 - (1 - p) * (1 - p)) * Math.PI;       // ease-out: starts fast, so it reacts at once
+    const cs = Math.cos(th), sn = Math.sin(th);
+    const half = tile / 2, cx = x + half, cy = y + half;
+    const s = half * sn, D = tile * PERSPECTIVE;
+    const wFar = half * (D - s) / (D + s);
+    const yt = cy - half * cs, yb = cy + half * cs;
+
+    g.fillStyle = th < Math.PI / 2 ? COLORS.dark : COLORS.pink;
+    g.beginPath();
+    g.moveTo(cx - wFar, yt); g.lineTo(cx + wFar, yt);
+    g.lineTo(cx + half, yb); g.lineTo(cx - half, yb);
+    g.closePath(); g.fill();
+  }
+
+  // Bottom frame: recorder (left), loop bars, reset button (centre). Repainted as a whole.
+  function drawUI() {
+    const top = oy + gridH, TAU = Math.PI * 2;
+    g.fillStyle = COLORS.frame; g.fillRect(0, top, W, H - top);
+
+    g.fillStyle = COLORS.pink;
+    g.beginPath(); g.arc(btn.x, btn.y, btn.r, 0, TAU); g.fill();
+
+    // recorder: ring + dot (idle); digit inside the ring with a sweeping arc (countdown);
+    // pulsing disc + stop square (recording); faded ring (stopping)
+    const { x, y, r } = rec, lw = Math.max(1.5, dpr * 2);
+    g.save();
+    g.strokeStyle = COLORS.pink; g.fillStyle = COLORS.pink; g.lineWidth = lw;
+    if (rec.state === 'stopping') g.globalAlpha = 0.45;
+    if (rec.state === 'recording') {
+      g.globalAlpha = 0.75 + 0.25 * Math.sin(performance.now() / 160);
+      g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+      g.fillStyle = COLORS.frame; const q = r * 0.62; g.fillRect(x - q / 2, y - q / 2, q, q);
+    } else {
+      g.beginPath(); g.arc(x, y, r - lw / 2, 0, TAU); g.stroke();
+      if (rec.state === 'idle') { g.beginPath(); g.arc(x, y, r * 0.42, 0, TAU); g.fill(); }
+      if (rec.state === 'countdown') {
+        g.textAlign = 'center'; g.textBaseline = 'middle';
+        g.font = `600 ${Math.round(r * 1.15)}px system-ui, sans-serif`;
+        g.fillText(String(rec.count), x, y + r * 0.05);
+        const prog = Math.min(1, (performance.now() - rec.cdStart) / 3000);
+        g.lineWidth = lw * 1.6;
+        g.beginPath(); g.arc(x, y, r + lw * 2.2, -Math.PI / 2, -Math.PI / 2 + prog * TAU); g.stroke();
+      }
+    }
+    g.restore();
+
+    // loop bars: one slim solid bar per loop, in the order they were recorded
+    g.fillStyle = COLORS.pink;
+    g.globalAlpha = (rec.state === 'recording' || rec.state === 'stopping') ? 0.35 : 1;   // dimmed while paused
+    for (let i = 0; i < loops.length && i < slots.length; i++) g.fillRect(slots[i].x, slots[i].y, bar.w, bar.h);
+    g.globalAlpha = 1;
+  }
+
+  const uiActive = () => rec.state !== 'idle' || loops.length > 0;
+
+  let rafId = 0, lastT = 0;
+  function frame(now) {
+    rafId = 0;
+    const dt = Math.min(50, Math.max(4, now - lastT)); lastT = now;
+
+    // Slid tiles flip back once their note has died away.
+    if (transients.size) {
+      const t = performance.now();
+      for (const [i, exp] of transients) {
+        if (t >= exp) { transients.delete(i); kind[i] = 0; target[i] = 0; animating.add(i); }
+      }
+    }
+
+    const step = dt / FLIP_MS;
+    for (const i of animating) {
+      let p = pos[i]; const t = target[i];
+      p = p < t ? Math.min(t, p + step) : Math.max(t, p - step);
+      pos[i] = p;
+      if (p === t) { animating.delete(i); drawStatic(i); } else drawFlip(i, p);
+    }
+    drawUI();
+    if ((animating.size || transients.size || uiActive()) && !rafId) rafId = requestAnimationFrame(frame);
+  }
+  function kick() {
+    if (!rafId) { lastT = performance.now() - 8; rafId = requestAnimationFrame(frame); }
+  }
+
+  /* =====================================================================
+     TILE ACTIONS
+     ===================================================================== */
+  function setVisual(i, on) {
+    if (target[i] === on) return;
+    target[i] = on; animating.add(i); kick();
+  }
+
+  function makeTapped(i) {            // black or fading tile -> stays pink with a held note
+    kind[i] = 1; transients.delete(i); pink.add(keyOf(i));
+    setVisual(i, 1);
+    AudioEngine.sustain(noteMap[i], 1);
+  }
+
+  function clearTapped(i) {           // tapped tile -> black, note released
+    kind[i] = 0; pink.delete(keyOf(i));
+    setVisual(i, 0);
+    AudioEngine.sustain(noteMap[i], -1);
+  }
+
+  function demoteToSlid(i) {          // a tap that turned into a slide: let it fade instead of stay
+    pink.delete(keyOf(i));
+    AudioEngine.sustain(noteMap[i], -1);
+    kind[i] = 2; transients.set(i, performance.now() + LIFE_MS); kick();
+  }
+
+  function playSlid(i) {              // a tile crossed during a slide
+    if (kind[i] === 1) return;        // tapped tiles are left alone
+    kind[i] = 2;
+    transients.set(i, performance.now() + LIFE_MS);
+    setVisual(i, 1);
+    AudioEngine.pluck(noteMap[i]);
+    kick();
+  }
+
+  function resetAll() {
+    for (let i = 0; i < target.length; i++) {
+      if (target[i]) { target[i] = 0; animating.add(i); }
+      kind[i] = 0;
+    }
+    pink.clear(); transients.clear();
+    AudioEngine.resync(new Map());
+    loops.splice(0).forEach(l => AudioEngine.stopLoop(l));      // reset clears the loops too
+    lastBarTap = { loop: null, t: 0 };
+    if (rec.state === 'countdown') cancelCountdown();
+    else if (rec.state === 'recording' || rec.state === 'stopping') {
+      rec.discard = true;                                       // an in-progress take is dropped
+      if (rec.state === 'recording') stopRecording();
+    }
+    kick();
+  }
+
+  /* =====================================================================
+     RECORDING AND LOOPS
+     idle -> countdown (3,2,1; nothing captured) -> recording -> stopping -> idle
+     ===================================================================== */
+  const MAX_REC_MS = 60000;
+
+  function pressRecorder() {
+    if (rec.state === 'countdown') { cancelCountdown(); return; }
+    if (rec.state === 'recording') { stopRecording(); return; }
+    if (rec.state !== 'idle' || loops.length >= slots.length) return;
+    AudioEngine.init();                         // needs a user gesture
+    if (!AudioEngine.available()) return;
+    rec.state = 'countdown'; rec.count = 3; rec.cdStart = performance.now(); kick();
+    rec.timers = [
+      setTimeout(() => { rec.count = 2; }, 1000),
+      setTimeout(() => { rec.count = 1; }, 2000),
+      setTimeout(beginRecording, 3000)
+    ];
+  }
+
+  function cancelCountdown() {
+    rec.timers.forEach(clearTimeout); rec.timers = [];
+    rec.state = 'idle'; kick();
+  }
+
+  async function beginRecording() {
+    await AudioEngine.captureReady();
+    if (rec.state !== 'countdown') return;
+    loops.forEach(l => AudioEngine.stopLoop(l));   // silence existing loops so only the new take is heard and recorded
+    AudioEngine.startCapture();
+    rec.state = 'recording';
+    rec.maxTimer = setTimeout(stopRecording, MAX_REC_MS);
+  }
+
+  async function stopRecording() {
+    if (rec.state !== 'recording') return;
+    rec.state = 'stopping'; clearTimeout(rec.maxTimer);
+    const data = await AudioEngine.stopCapture();
+    const loop = AudioEngine.makeLoop(data);    // null if nothing audible was played
+    if (loop && !rec.discard) loops.push(loop); else if (loop) AudioEngine.stopLoop(loop);
+    rec.discard = false;
+    loops.forEach(l => AudioEngine.playLoop(l));   // every loop restarts together, in sync
+    rec.state = 'idle'; kick();
+  }
+
+  function deleteLoop(loop) {
+    const i = loops.indexOf(loop);
+    if (i < 0) return;
+    AudioEngine.stopLoop(loop);
+    loops.splice(i, 1);
+    kick();
+  }
+
+  /* =====================================================================
+     POINTER INPUT (multi-touch)
+     Every pointer has its own state, keyed by pointerId, so any number of
+     fingers can press, slide and lift independently.
+     Pressing a tile toggles it and it stays. If that pointer then moves on
+     to another tile it is a slide: slid tiles play, then fade out.
+     ===================================================================== */
+  const pointers = new Map();   // pointerId -> { touched, lastX, lastY, pendingIdx }
+  let lastBarTap = { loop: null, t: 0 };
+
+  function indexAt(clientX, clientY) {
+    const c = Math.floor((clientX * dpr - ox) / cell);
+    const r = Math.floor((clientY * dpr - oy) / cell);
+    return (c < 0 || r < 0 || c >= cols || r >= rows) ? -1 : r * cols + c;
+  }
+
+  function overCircle(o, clientX, clientY) {
+    const dx = clientX * dpr - o.x, dy = clientY * dpr - o.y, r = o.r + 6 * dpr;
+    return dx * dx + dy * dy <= r * r;
+  }
+
+  function barAt(clientX, clientY) {
+    const px = clientX * dpr, py = clientY * dpr, pad = Math.max(2 * dpr, bar.gap / 2);
+    for (let i = 0; i < loops.length && i < slots.length; i++) {
+      const s = slots[i];
+      if (px >= s.x - pad && px <= s.x + bar.w + pad && py >= s.y - pad && py <= s.y + bar.h + pad) return i;
+    }
+    return -1;
+  }
+
+  // Controls in the bottom frame. Returns true when the press belongs to a control, not a tile.
+  function pressControls(e) {
+    if (overCircle(btn, e.clientX, e.clientY)) { resetAll(); return true; }
+    if (overCircle(rec, e.clientX, e.clientY)) { pressRecorder(); return true; }
+    const b = barAt(e.clientX, e.clientY);
+    if (b >= 0) {
+      const loop = loops[b], t = performance.now();
+      if (lastBarTap.loop === loop && t - lastBarTap.t < 350) { deleteLoop(loop); lastBarTap = { loop: null, t: 0 }; }
+      else lastBarTap = { loop, t };
+      return true;
+    }
+    return false;
+  }
+
+  function touchAt(st, x, y) {
+    const i = indexAt(x, y);
+    if (i < 0 || st.touched.has(i)) return;
+    st.touched.add(i);
+    if (st.pendingIdx >= 0) { demoteToSlid(st.pendingIdx); st.pendingIdx = -1; }
+    playSlid(i);
+  }
+
+  function touchAlong(st, x0, y0, x1, y1) {
+    const dx = x1 - x0, dy = y1 - y0;
+    const steps = Math.max(1, Math.ceil(Math.hypot(dx, dy) / (cell / dpr * 0.4)));
+    for (let s = 1; s <= steps; s++) touchAt(st, x0 + dx * s / steps, y0 + dy * s / steps);
+  }
+
+  function startGesture(e) {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    e.preventDefault();
+    if (pointers.has(e.pointerId) || pressControls(e)) return;
+
+    AudioEngine.init();                       // browsers only allow audio after a user gesture
+    const st = { touched: new Set(), lastX: e.clientX, lastY: e.clientY, pendingIdx: -1 };
+    pointers.set(e.pointerId, st);
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+
+    const i = indexAt(e.clientX, e.clientY);
+    if (i >= 0) {
+      st.touched.add(i);
+      if (kind[i] === 1) clearTapped(i);
+      else { makeTapped(i); st.pendingIdx = i; }
+    }
+  }
+
+  function trackGesture(e) {
+    const st = pointers.get(e.pointerId);
+    if (!st) {
+      if (e.pointerType === 'mouse') {
+        canvas.style.cursor = (overCircle(btn, e.clientX, e.clientY) || overCircle(rec, e.clientX, e.clientY) || barAt(e.clientX, e.clientY) >= 0) ? 'pointer' : 'default';
+      }
+      return;
+    }
+    const list = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+    for (const ev of (list.length ? list : [e])) {
+      touchAlong(st, st.lastX, st.lastY, ev.clientX, ev.clientY);
+      st.lastX = ev.clientX; st.lastY = ev.clientY;
+    }
+  }
+
+  function endGesture(e) {
+    if (!pointers.delete(e.pointerId)) return;     // only this pointer ends; others carry on. A pending tap simply stays.
+    try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+  }
+
+  canvas.addEventListener('pointerdown', startGesture);
+  canvas.addEventListener('pointermove', trackGesture);
+  canvas.addEventListener('pointerup', endGesture);
+  canvas.addEventListener('pointercancel', endGesture);
+  canvas.addEventListener('lostpointercapture', endGesture);
+  canvas.addEventListener('dragstart', e => e.preventDefault());
+  canvas.addEventListener('selectstart', e => e.preventDefault());
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  canvas.addEventListener('gesturestart', e => e.preventDefault());   // Safari pinch
+
+  /* =====================================================================
+     RESIZE
+     ===================================================================== */
+  let resizeQueued = false;
+  function handleResize() {
+    if (resizeQueued) return;
+    resizeQueued = true;
+    requestAnimationFrame(() => {
+      resizeQueued = false;
+      const L = computeLayout();
+      if (L.w === W && L.h === H && L.cell === cell && L.cols === cols && L.rows === rows) return;
+      applyLayout(L);
+    });
+  }
+  window.addEventListener('resize', handleResize);
+
+  applyLayout(computeLayout());
+})();
+</script>
+</body>
+</html>
